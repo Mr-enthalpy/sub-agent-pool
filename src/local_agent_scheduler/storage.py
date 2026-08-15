@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 7
 
 
 def new_id(prefix: str) -> str:
@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     continuity TEXT NOT NULL CHECK (continuity IN ('required','preferred','none')),
     affinity_tags_json TEXT NOT NULL DEFAULT '[]',
     workspace_mode TEXT NOT NULL CHECK (workspace_mode IN ('read_only','write')),
-    required INTEGER NOT NULL CHECK (required IN (0,1)),
+    required INTEGER NOT NULL CHECK (required = 1),
     priority INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL CHECK (state IN ('BLOCKED','QUEUED','LEASED','RUNNING','RETRY_WAIT','SUSPENDED','COMPLETED','CANCELLED')),
     max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS logical_agents (
     updated_at REAL NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS one_active_assignment_per_agent
+CREATE UNIQUE INDEX IF NOT EXISTS one_assigned_agent_per_task
 ON logical_agents(current_task_id)
 WHERE current_task_id IS NOT NULL AND state = 'ASSIGNED';
 
@@ -187,6 +187,7 @@ CREATE TABLE IF NOT EXISTS executions (
     incarnation_id TEXT NOT NULL REFERENCES incarnations(id) ON DELETE RESTRICT,
     execution_target TEXT NOT NULL,
     execution_profile TEXT NOT NULL,
+    attempt_isolation INTEGER NOT NULL DEFAULT 0 CHECK (attempt_isolation IN (0,1)),
     state TEXT NOT NULL CHECK (state IN ('STARTING','RUNNING','SUCCEEDED','FAILED','LOST','UNKNOWN','TERMINATED')),
     runtime_handle_json TEXT NOT NULL DEFAULT '{}',
     outcome_json TEXT,
@@ -373,6 +374,44 @@ class Database:
                         "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                         (3, utc_now()),
                     )
+                    current = 3
+                if current < 4:
+                    self._migrate_v3_to_v4(conn)
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (4, utc_now()),
+                    )
+                    current = 4
+                else:
+                    # Reassert correctness indexes/triggers if an operator
+                    # removed one without changing the schema marker.
+                    self._migrate_v3_to_v4(conn)
+                if current < 5:
+                    self._migrate_v4_to_v5(conn)
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (5, utc_now()),
+                    )
+                    current = 5
+                else:
+                    self._migrate_v4_to_v5(conn)
+                if current < 6:
+                    self._migrate_v5_to_v6(conn)
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (6, utc_now()),
+                    )
+                    current = 6
+                else:
+                    self._migrate_v5_to_v6(conn)
+                if current < 7:
+                    self._migrate_v6_to_v7(conn)
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (7, utc_now()),
+                    )
+                else:
+                    self._migrate_v6_to_v7(conn)
                 conn.execute("COMMIT")
                 conn.execute("PRAGMA foreign_keys = ON")
                 violations = conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -580,6 +619,164 @@ class Database:
                 "INSERT INTO scheduler_meta(key,value_json,updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(key) DO NOTHING",
                 ("topology_bootstrapped", json_dumps({"source": "sqlite-v2"}), now),
+            )
+
+    @staticmethod
+    def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+        """Close optional-work and authority uniqueness at the storage layer.
+
+        Ambiguous legacy authority is never normalized.  The operator must
+        inspect and repair the v3 database before retrying the migration.
+        """
+
+        optional = conn.execute(
+            "SELECT id FROM tasks WHERE required<>1 LIMIT 1"
+        ).fetchone()
+        if optional:
+            raise RuntimeError(
+                f"schema v4 migration found unsupported optional Task {optional['id']}"
+            )
+        duplicate_agent = conn.execute(
+            "SELECT logical_agent_id FROM attempts WHERE state='ACTIVE' "
+            "GROUP BY logical_agent_id HAVING COUNT(*)>1 LIMIT 1"
+        ).fetchone()
+        if duplicate_agent:
+            raise RuntimeError(
+                "schema v4 migration found multiple ACTIVE Attempts for LogicalAgent "
+                f"{duplicate_agent['logical_agent_id']}"
+            )
+        duplicate_attempt = conn.execute(
+            "SELECT attempt_id FROM executions GROUP BY attempt_id "
+            "HAVING COUNT(*)>1 LIMIT 1"
+        ).fetchone()
+        if duplicate_attempt:
+            raise RuntimeError(
+                "schema v4 migration found multiple Executions for Attempt "
+                f"{duplicate_attempt['attempt_id']}"
+            )
+
+        conn.execute("DROP INDEX IF EXISTS one_active_assignment_per_agent")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS one_assigned_agent_per_task "
+            "ON logical_agents(current_task_id) "
+            "WHERE current_task_id IS NOT NULL AND state='ASSIGNED'"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS one_active_attempt_per_agent "
+            "ON attempts(logical_agent_id) WHERE state='ACTIVE'"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS one_execution_per_attempt "
+            "ON executions(attempt_id)"
+        )
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS tasks_required_insert_only "
+            "BEFORE INSERT ON tasks WHEN NEW.required<>1 BEGIN "
+            "SELECT RAISE(ABORT,'optional Tasks are not supported'); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS tasks_required_update_only "
+            "BEFORE UPDATE OF required ON tasks WHEN NEW.required<>1 BEGIN "
+            "SELECT RAISE(ABORT,'optional Tasks are not supported'); END"
+        )
+
+    @staticmethod
+    def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+        """Freeze writer isolation per Execution and close legacy drain residue.
+
+        Existing Executions are conservatively marked non-isolated.  Current
+        target configuration is not evidence about the safety properties under
+        which a historical physical Execution was started.
+        """
+
+        execution_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(executions)")
+        }
+        if "attempt_isolation" not in execution_columns:
+            conn.execute(
+                "ALTER TABLE executions ADD COLUMN attempt_isolation INTEGER "
+                "NOT NULL DEFAULT 0 CHECK (attempt_isolation IN (0,1))"
+            )
+
+        # V0.1.1 could leave excess unassigned agents permanently DRAINING.
+        # retirement_requested=1 is already an explicit semantic-retirement
+        # decision, so completing it does not invent a new lifecycle choice.
+        conn.execute(
+            "UPDATE logical_agents SET state='RETIRED',retirement_requested=0,"
+            "available_since=NULL,updated_at=? "
+            "WHERE state='DRAINING' AND current_task_id IS NULL "
+            "AND pending_partition_name IS NULL AND retirement_requested=1",
+            (utc_now(),),
+        )
+
+    @staticmethod
+    def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+        """Preserve unresolved physical work and close semantic retirement presence."""
+
+        now = utc_now()
+        conn.execute(
+            "UPDATE executions SET state='UNKNOWN',ended_at=NULL,updated_at=? "
+            "WHERE state='FAILED' AND terminal_confirmed=0",
+            (now,),
+        )
+        conn.execute(
+            "UPDATE incarnations SET state='LOST',ended_at=COALESCE(ended_at,?) "
+            "WHERE state IN ('STARTING','WARM','COLD') "
+            "AND logical_agent_id IN (SELECT id FROM logical_agents WHERE state='RETIRED')",
+            (now,),
+        )
+
+    @staticmethod
+    def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+        """Reject ambiguous topology damage created before MERGE/RETIRE closure.
+
+        Pre-closure MERGE revisions did not snapshot either partition's declared
+        capacity, so lost desired topology cannot be reconstructed from runtime
+        population.  Pre-closure MERGE and RETIRE could also strand nonterminal
+        Tasks on inactive partitions.  Both conditions require an explicit
+        operator repair rather than a guessed migration.
+        """
+
+        revisions = conn.execute(
+            "SELECT revision,payload_json FROM pool_topology_revisions "
+            "WHERE operation='MERGE' ORDER BY revision"
+        ).fetchall()
+        for revision in revisions:
+            try:
+                payload = json_loads(revision["payload_json"], {})
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = None
+            source_capacity = (
+                payload.get("source_capacity") if isinstance(payload, dict) else None
+            )
+            target_capacity = (
+                payload.get("target_capacity") if isinstance(payload, dict) else None
+            )
+            valid_snapshot = (
+                isinstance(source_capacity, int)
+                and not isinstance(source_capacity, bool)
+                and source_capacity >= 0
+                and isinstance(target_capacity, int)
+                and not isinstance(target_capacity, bool)
+                and target_capacity >= 0
+            )
+            if not valid_snapshot:
+                raise RuntimeError(
+                    "LEGACY_TOPOLOGY_REPAIR_REQUIRED: MERGE revision "
+                    f"{revision['revision']} lacks valid declared-capacity snapshots"
+                )
+
+        stranded = conn.execute(
+            "SELECT t.id,t.state,t.partition_name FROM tasks t "
+            "JOIN pool_partitions p ON p.name=t.partition_name "
+            "WHERE t.state NOT IN ('COMPLETED','CANCELLED') AND p.active=0 "
+            "ORDER BY t.created_at,t.id LIMIT 1"
+        ).fetchone()
+        if stranded:
+            raise RuntimeError(
+                "LEGACY_TOPOLOGY_REPAIR_REQUIRED: nonterminal Task "
+                f"{stranded['id']} in state {stranded['state']} remains on inactive "
+                f"partition {stranded['partition_name']}"
             )
 
     @contextlib.contextmanager

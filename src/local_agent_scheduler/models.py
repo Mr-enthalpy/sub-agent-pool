@@ -40,7 +40,6 @@ class TaskSpec:
     affinity_tags: tuple[str, ...] = ()
     workspace_mode: WorkspaceMode = WorkspaceMode.READ_ONLY
     dependencies: tuple[str, ...] = ()
-    required: bool = True
     priority: int = 0
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
     supersedes_task_id: str | None = None

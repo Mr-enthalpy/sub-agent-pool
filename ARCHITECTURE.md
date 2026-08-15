@@ -587,7 +587,7 @@ COMPLETED
 CANCELLED
 ```
 
-A normal batch completes when all required Tasks have durably completed and their authoritative Results have entered the Result Queue.
+A normal batch completes when all required Tasks have durably completed and their authoritative Results have entered the Result Queue. V0.1 exposes no optional Task path, so every submitted Task is required at this barrier.
 
 Root consumption of those Results is not required for Scheduler completion.
 
@@ -818,6 +818,10 @@ physical death
 semantic retirement
 → requires new birth if capacity is later needed
 ```
+
+Semantic retirement also fences every reusable STARTING/WARM/COLD Incarnation.
+An identity that is terminal at the LogicalAgent layer cannot retain an
+authoritative warm physical presence outside Scheduler lifecycle ownership.
 
 ---
 
@@ -1082,6 +1086,18 @@ A successful MOVE preserves:
 
 For BUSY agents, V0.1 should normally apply the move at an assignment/drain boundary.
 
+Current and desired scheduling membership are distinct during that boundary:
+`partition_name` records current membership, while `pending_partition_name`
+records desired membership. Pool reconciliation and later topology revisions
+must compose against desired membership so consecutive MOVE/MERGE operations do
+not strand an identity in an inactive partition.
+
+An idle READY agent has no future assignment boundary.  If a MOVE crosses
+ExecutionTarget and its previous Incarnation has no active Execution, the
+topology transaction fences that old reusable binding as LOST and immediately
+moves the same LogicalAgent identity.  It must not create an unassigned,
+permanently DRAINING identity.
+
 A topology change must not silently mutate the role contract governing an already-active Attempt.
 
 ---
@@ -1100,6 +1116,35 @@ Shared state should be communicated through Workstream/project/checkpoint state.
 
 A merge therefore affects scheduling classification, not agent minds.
 
+For V0.1, MERGE also moves every nonterminal source Task's future scheduling classification to the target. An already-active Attempt keeps its frozen LogicalAgent, ExecutionTarget/Profile, and lease epoch; only later retry/dispatch observes the target partition. Desired target capacity is the sum of the two declared capacities at the topology revision boundary, never a function of instantaneous runtime population.
+
+If an assignment ends in writer-safety suspension, desired membership remains
+pending until quiescence or frozen attempt isolation is proven. Resolving that
+obligation must commit the canonical destination and its retention policy before
+the LogicalAgent becomes schedulable again; every authority-ending path uses
+the same cutover invariant.
+
+Lease expiry may intentionally leave the old physical Execution in
+STARTING/RUNNING/UNKNOWN for stale-history reconciliation. Once authority has
+ended, that row does not prevent logical topology detachment when the work was
+read-only, the Execution's frozen snapshot proves attempt isolation, or
+quiescence is confirmed. It continues to block a non-isolated writer whose
+quiescence is unknown.
+
+This safety predicate belongs to the cutover primitive, not to its caller.
+Consequently topology composition is order independent: expiry followed by
+MOVE/MERGE and MOVE/MERGE followed by expiry produce the same safe detachment or
+the same suspended desired membership.
+
+The same idle cross-target cutover rule applies during MERGE: inactive reusable
+presence is fenced, while only an actually ASSIGNED identity uses a pending
+drain transition. MERGE rebases pending inbound references to the canonical
+target and preserves an already-different desired destination. At an immediate
+or assignment-boundary cutover, the LogicalAgent adopts the destination
+partition's retention policy. If the destination changes ExecutionTarget, any
+terminal/quiescent reusable presence on the old target is fenced before the
+membership commit.
+
 ---
 
 # 23. Partition Removal and Semantic Death
@@ -1116,6 +1161,10 @@ BUSY members
 ```
 
 This is semantic death.
+
+RETIRE must reject a partition that still has nonterminal Tasks or inbound
+desired LogicalAgents. It cannot leave a pending transition pointing at a
+retired partition.
 
 A later deficit for a similar role should create newborn agents rather than silently reviving semantically retired ones.
 
@@ -1287,7 +1336,13 @@ collect_outcome(...)
 reconcile_start(...)
 ```
 
-The exact API is not yet frozen.
+These are synchronous Scheduler-facing operations. Every Adapter implementation
+must bound each call with its own configured operation deadline, including all
+underlying process, transport, and stream I/O, and translate timeout into the
+standard outcome vocabulary. The Scheduler does not provide a generic watchdog
+for a non-conforming Adapter.
+
+The exact API is not yet frozen beyond this bounded-call correctness contract.
 
 The Adapter receives enough input to instantiate one physical execution.
 
@@ -1375,7 +1430,7 @@ the old physical writer has stopped mutating files.
 
 Therefore fencing protects Scheduler state but cannot alone protect a shared filesystem.
 
-A replacement writer must not be started against the same mutable workspace until the previous writer is positively quiescent, unless stronger attempt isolation exists.
+A replacement writer must not be started against the same mutable workspace until the previous writer is positively quiescent, unless stronger attempt isolation exists. Any isolation fact used for this proof belongs to the concrete Execution created under it and must be durably frozen before physical start; current ExecutionTarget configuration cannot retroactively grant or revoke that fact after restart.
 
 Read-only duplicate attempts may be tolerated where appropriate.
 
@@ -1413,6 +1468,22 @@ If start state is ambiguous:
 * apply stricter rules to writer tasks
 * suspend if correctness cannot be mechanically established
 
+An Execution row and a configured Adapter do not themselves prove that the
+current daemon supervises that physical work. Lease renewal requires
+daemon-owned admission after a bounded start/reconciliation positively confirms
+the exact Execution as RUNNING. UNKNOWN/ambiguous reconciliation never rolls
+that admission deadline forward; when the existing Lease expires, ordinary
+fencing and writer-quiescence rules apply.
+
+A positive RUNNING observation establishes state and renews its Lease in one
+fenced transaction. Daemon-owned supervision admission occurs only after that
+commit; a separate first heartbeat is not an authority bridge.
+Core heartbeat APIs accept only a persisted RUNNING Execution. A late bounded
+start that lost authority records its physical state and complete runtime handle
+on the exact Execution/Incarnation without admitting supervision or modifying
+Task authority; ambiguous and terminal late starts use the same physical-only
+path.
+
 The Core should understand standardized ambiguity, not frontend-specific exception text.
 
 ---
@@ -1445,6 +1516,12 @@ retry_hint
 ```
 
 Scheduler policy operates on these standardized facts.
+
+Supervisor or adapter unavailability is not evidence that a physical Execution
+failed or became quiescent. When Task authority must be revoked while physical
+termination remains unconfirmed, the Execution stays UNKNOWN and reconcilable.
+In particular, a non-isolated writer with unknown quiescence continues to block
+cross-target physical detachment until the safety obligation is resolved.
 
 Scheduler must not parse CCR-, Codex-, TokenRhythm-, OpenCode-, or provider-specific error strings.
 
@@ -1524,6 +1601,8 @@ The actual data remains in:
 Notifications should use a durable outbox so Scheduler crashes do not silently lose wakeups.
 
 At-least-once notification plus event-ID deduplication is sufficient.
+
+Notification delivery should run independently from execution supervision and lease renewal. A notifier owns only outbox delivery state and bounded RootBridge calls; it does not consume Results or assume scheduling authority.
 
 ---
 
@@ -1694,6 +1773,12 @@ Future isolation into another process should preserve the logical contract.
 # 40. Scheduler Restart
 
 Scheduler restart must be recovery-aware.
+
+Migration must not invent historical topology intent. If an older topology
+operation omitted the declared-capacity facts needed to reconstruct MERGE, or
+left nonterminal work on an inactive partition, startup rejects the database
+atomically and requires explicit operator repair instead of guessing from the
+current agent population.
 
 Normal dispatch should not begin immediately after process startup.
 

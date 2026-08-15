@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import io
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from local_agent_scheduler.cli import main as cli_main
 from local_agent_scheduler.config import ExecutionTargetConfig, load_config
 from local_agent_scheduler.adapters.codex import CodexAppServerAdapter
 from local_agent_scheduler.core import Scheduler
@@ -16,8 +20,9 @@ from local_agent_scheduler.enums import (
     FailureClass,
     Retention,
     TaskState,
+    WorkspaceMode,
 )
-from local_agent_scheduler.errors import ConfigurationError
+from local_agent_scheduler.errors import ConfigurationError, StaleAuthority
 from local_agent_scheduler.models import (
     ExecutionObservation,
     ExecutionOutcome,
@@ -103,6 +108,45 @@ class HangingAdapter(FakeAdapter):
         return ExecutionOutcome(ExecutionState.RUNNING)
 
 
+class AlwaysAmbiguousAdapter(FakeAdapter):
+    def start_execution(self, request):
+        handle = {"request_id": request.request_id, "execution_id": request.execution_id}
+        return StartObservation(ExecutionState.UNKNOWN, handle, ambiguous=True)
+
+    def reconcile_start(self, request_id, runtime_handle):
+        return StartObservation(ExecutionState.UNKNOWN, runtime_handle, ambiguous=True)
+
+
+class FailedStartAdapter(FakeAdapter):
+    def start_execution(self, request):
+        return StartObservation(
+            ExecutionState.FAILED,
+            {"request_id": request.request_id, "thread_id": "late-failed-thread"},
+            failure_class=FailureClass.START_FAILURE,
+            failure_code="LATE_START_FAILED",
+            detail="bounded start returned after authority ended",
+        )
+
+
+class ReconcileRunningWithNewHandleAdapter(FakeAdapter):
+    def reconcile_start(self, request_id, runtime_handle):
+        return StartObservation(
+            ExecutionState.RUNNING,
+            {
+                "request_id": request_id,
+                "thread_id": "recovered-thread",
+                "turn_id": "recovered-turn",
+            },
+        )
+
+
+class RecoveryFailsAfterAdmissionAdapter(FakeAdapter):
+    def observe_execution(self, runtime_handle):
+        if runtime_handle.get("recovery_order") == 2:
+            raise RuntimeError("injected recovery observation failure")
+        return ExecutionObservation(ExecutionState.RUNNING)
+
+
 class FakeProcess:
     def poll(self):
         return None
@@ -136,13 +180,13 @@ class FakeRootSession:
             }
         ]
 
-    def close(self):
+    def close(self, **_kwargs):
         self.closed = True
         return True
 
 
 class FakeStoredSession(FakeRootSession):
-    def request(self, method, params):
+    def request(self, method, params, **_kwargs):
         self.requests.append((method, params))
         if method == "thread/read":
             return {
@@ -162,7 +206,7 @@ class FakeStoredSession(FakeRootSession):
 
 
 class FakeInterruptedSession(FakeRootSession):
-    def request(self, method, params):
+    def request(self, method, params, **_kwargs):
         self.requests.append((method, params))
         if method == "thread/read":
             return {
@@ -239,7 +283,12 @@ class RuntimeCase(unittest.TestCase):
         self.assertGreaterEqual(second["observed"], 1)
         self.assertEqual(self.scheduler.get("tasks", ids["run"])["state"], TaskState.COMPLETED)
         self.assertEqual(self.scheduler.get("batches", batch_id)["state"], "COMPLETED")
-        dispatcher.tick()
+        daemon = SchedulerDaemon(dispatcher, poll_seconds=0.001)
+        daemon._start_notifier()
+        deadline = time.monotonic() + 1
+        while not list((self.root / "events").glob("*.json")) and time.monotonic() < deadline:
+            time.sleep(0.001)
+        daemon._stop_notifier()
         envelopes = list((self.root / "events").glob("*.json"))
         self.assertEqual(len(envelopes), 1)
 
@@ -257,6 +306,115 @@ class RuntimeCase(unittest.TestCase):
         self.assertEqual(totals["dispatched"], 1)
         self.assertGreaterEqual(totals["observed"], 1)
         self.assertEqual(self.scheduler.get("tasks", ids["one-shot"])["state"], "COMPLETED")
+
+    def test_cli_daemon_starts_with_mixed_available_and_unavailable_topology(self) -> None:
+        _seed_batch, _seed_ids = self.scheduler.submit_batch(
+            [TaskSpec("pending-notification", {})]
+        )
+        seed_claim = self.scheduler.claim_next_available()
+        self.scheduler.ack_success(
+            seed_claim.attempt_id,
+            seed_claim.lease_epoch,
+            execution_id=None,
+            payload={"seed": True},
+        )
+        self.assertTrue(self.scheduler.list("notification_outbox", state="PENDING"))
+
+        self.scheduler.upsert_partition(
+            PartitionSpec(
+                "unavailable",
+                1,
+                Retention.RESIDENT,
+                "missing-target",
+                "missing-profile",
+            )
+        )
+        self.scheduler.reconcile_pool()
+        _healthy_batch, healthy_ids = self.scheduler.submit_batch(
+            [TaskSpec("healthy", {}, partition="general")]
+        )
+        _bad_batch, bad_ids = self.scheduler.submit_batch(
+            [
+                TaskSpec(
+                    "unavailable",
+                    {},
+                    partition="unavailable",
+                    retry_policy=RetryPolicy(max_attempts=1, retry_classes=()),
+                )
+            ]
+        )
+        with self.scheduler.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO scheduler_meta(key,value_json,updated_at) VALUES(?,?,?)",
+                ("topology_bootstrapped", "{}", time.time()),
+            )
+        config_path = self.root / "scheduler.toml"
+        config_path.write_text(
+            """schema_version = 1
+database_path = "scheduler.db"
+lease_seconds = 5
+heartbeat_seconds = 1
+continuity_max_bytes = 65536
+dispatcher_poll_seconds = 0.001
+
+[retry_defaults]
+max_attempts = 1
+retry_classes = []
+base_backoff_seconds = 0
+max_backoff_seconds = 0
+
+[execution_profiles.default]
+
+[[execution_targets]]
+name = "codex"
+adapter = "codex_app_server"
+attempt_isolation = false
+termination_confirmation = true
+
+[adapters.codex_app_server]
+command = ["codex", "app-server"]
+cwd = "."
+approval_policy = "never"
+sandbox = "workspace-write"
+
+[root_bridge]
+kind = "filesystem"
+inbox = "events"
+request_timeout = 1
+completion_timeout = 1
+""",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "local_agent_scheduler.cli.CodexAppServerAdapter",
+            side_effect=lambda **_kwargs: FakeAdapter(),
+        ), patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(
+                cli_main(["--config", str(config_path), "daemon", "--once"]),
+                0,
+            )
+
+        self.assertEqual(
+            self.scheduler.get("tasks", healthy_ids["healthy"])["state"],
+            "COMPLETED",
+        )
+        self.assertEqual(
+            self.scheduler.get("tasks", bad_ids["unavailable"])["state"],
+            "SUSPENDED",
+        )
+        bad_failure = next(
+            failure
+            for failure in self.scheduler.list("failures")
+            if failure["task_id"] == bad_ids["unavailable"]
+        )
+        self.assertEqual(
+            bad_failure["failure_code"], "EXECUTION_CONFIGURATION_UNAVAILABLE"
+        )
+        self.assertEqual(
+            self.scheduler.list("notification_outbox", state="PENDING"), []
+        )
+        self.assertTrue(list((self.root / "events").glob("*.json")))
 
     def test_daemon_once_timeout_terminates_instead_of_waiting_forever(self) -> None:
         _batch, ids = self.scheduler.submit_batch([TaskSpec("bounded-one-shot", {})])
@@ -310,6 +468,360 @@ class RuntimeCase(unittest.TestCase):
         self.assertEqual(result["retried"], 1)
         restarted.promote_retry_wait(now=106)
         self.assertEqual(restarted.get("tasks", ids["claimed"])["state"], TaskState.QUEUED)
+
+    def _expired_writer_after_isolation_config_change(
+        self, *, frozen_isolation: bool, current_isolation: bool
+    ) -> tuple[Scheduler, str]:
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [
+                TaskSpec(
+                    "writer-isolation-snapshot",
+                    {},
+                    workspace_mode=WorkspaceMode.WRITE,
+                    retry_policy=policy,
+                )
+            ]
+        )
+        claim = self.scheduler.claim_next_available()
+        execution_id, _request_id = self.scheduler.create_execution(
+            claim, attempt_isolation=frozen_isolation
+        )
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"writer": True},
+        )
+        with self.scheduler.db.transaction() as conn:
+            conn.execute(
+                "UPDATE leases SET expires_at=? WHERE id=?",
+                (time.time() - 1, claim.lease_id),
+            )
+
+        restarted = Scheduler(Database(self.db_path), lease_seconds=5)
+        restarted.initialize()
+        dispatcher = Dispatcher(
+            restarted,
+            adapters={"codex": FakeAdapter()},
+            targets={
+                "codex": ExecutionTargetConfig(
+                    "codex", "codex_app_server", current_isolation, True
+                )
+            },
+            workspace_root=self.root,
+        )
+        dispatcher.tick()
+        return restarted, ids["writer-isolation-snapshot"]
+
+    def test_restart_cannot_retroactively_grant_writer_attempt_isolation(self) -> None:
+        restarted, task_id = self._expired_writer_after_isolation_config_change(
+            frozen_isolation=False,
+            current_isolation=True,
+        )
+
+        self.assertEqual(restarted.get("tasks", task_id)["state"], "SUSPENDED")
+        escalation = restarted.list("escalations", state="OPEN")[-1]
+        self.assertEqual(
+            escalation["failure_class"],
+            FailureClass.WRITER_QUIESCENCE_UNKNOWN.value,
+        )
+
+    def test_restart_preserves_writer_isolation_when_current_config_removes_it(self) -> None:
+        restarted, task_id = self._expired_writer_after_isolation_config_change(
+            frozen_isolation=True,
+            current_isolation=False,
+        )
+
+        self.assertEqual(restarted.get("tasks", task_id)["state"], "RETRY_WAIT")
+        self.assertEqual(restarted.list("escalations", state="OPEN"), [])
+
+    def test_restart_fences_unexpired_claim_without_execution_before_heartbeat(self) -> None:
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("unstarted", {}, retry_policy=policy)]
+        )
+        agent = self.scheduler.list("logical_agents", state="READY")[0]
+        claim = self.scheduler.claim_next(agent["id"], now=time.time())
+        original_expiry = self.scheduler.get("leases", claim.lease_id)["expires_at"]
+
+        restarted = Scheduler(Database(self.db_path), lease_seconds=5)
+        restarted.initialize()
+        dispatcher = Dispatcher(
+            restarted,
+            adapters={"codex": FakeAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        daemon = SchedulerDaemon(
+            dispatcher, poll_seconds=0.01, heartbeat_seconds=0.02
+        )
+        try:
+            recovery = dispatcher.recover(after_expiry=daemon._start_supervision)
+        finally:
+            daemon._stop_supervision()
+
+        self.assertEqual(recovery["retried"], 1)
+        self.assertEqual(restarted.get("tasks", ids["unstarted"])["state"], "QUEUED")
+        lease = restarted.get("leases", claim.lease_id)
+        self.assertEqual(lease["state"], "EXPIRED")
+        self.assertEqual(lease["expires_at"], original_expiry)
+        failure = restarted.list("failures")[-1]
+        self.assertEqual(failure["failure_code"], "CLAIM_ORPHANED")
+
+    def test_recovery_failure_stops_heartbeat_and_clears_admissions(self) -> None:
+        self.scheduler.resize_partition("general", 2)
+        self.scheduler.reconcile_pool()
+        _batch, _ids = self.scheduler.submit_batch(
+            [TaskSpec("recover-one", {}, priority=2), TaskSpec("recover-two", {})]
+        )
+        claims = []
+        for order in (1, 2):
+            claim = self.scheduler.claim_next_available()
+            execution_id, _request = self.scheduler.create_execution(claim)
+            self.scheduler.confirm_execution_running(
+                claim.attempt_id,
+                claim.lease_epoch,
+                execution_id,
+                runtime_handle={"recovery_order": order},
+            )
+            with self.scheduler.db.transaction() as conn:
+                conn.execute(
+                    "UPDATE executions SET started_at=? WHERE id=?",
+                    (float(order), execution_id),
+                )
+            claims.append(claim)
+
+        restarted = Scheduler(Database(self.db_path), lease_seconds=5)
+        restarted.initialize()
+        dispatcher = Dispatcher(
+            restarted,
+            adapters={"codex": RecoveryFailsAfterAdmissionAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        daemon = SchedulerDaemon(
+            dispatcher, poll_seconds=0.001, heartbeat_seconds=0.005
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "injected recovery"):
+            daemon.run_until_idle(max_wait_seconds=1)
+
+        self.assertIsNone(daemon._heartbeat_thread)
+        self.assertEqual(dispatcher.supervised_attempt_ids(), set())
+        lease_after_cleanup = restarted.get("leases", claims[0].lease_id)["expires_at"]
+        time.sleep(0.03)
+        self.assertEqual(
+            restarted.get("leases", claims[0].lease_id)["expires_at"],
+            lease_after_cleanup,
+        )
+
+    def test_restart_ambiguous_execution_is_not_admitted_for_renewal(self) -> None:
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("ambiguous-restart", {}, retry_policy=policy)]
+        )
+        claim = self.scheduler.claim_next_available(now=time.time())
+        execution_id, request_id = self.scheduler.create_execution(claim)
+        self.scheduler.record_start_ambiguity(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"request_id": request_id},
+            detail="start identity remains ambiguous",
+        )
+        original_expiry = self.scheduler.get("leases", claim.lease_id)["expires_at"]
+
+        restarted = Scheduler(Database(self.db_path), lease_seconds=5)
+        restarted.initialize()
+        dispatcher = Dispatcher(
+            restarted,
+            adapters={"codex": AlwaysAmbiguousAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        daemon = SchedulerDaemon(
+            dispatcher, poll_seconds=0.001, heartbeat_seconds=0.005
+        )
+        try:
+            dispatcher.recover(after_expiry=daemon._start_supervision)
+            time.sleep(0.02)
+            dispatcher.poll_executions(recovery=True)
+            self.assertEqual(dispatcher.supervised_attempt_ids(), set())
+            self.assertEqual(dispatcher.renew_supervised_leases(), 0)
+        finally:
+            daemon._stop_supervision()
+
+        self.assertEqual(
+            restarted.get("leases", claim.lease_id)["expires_at"], original_expiry
+        )
+        expired = restarted.expire_leases(now=original_expiry + 1)
+        self.assertEqual(expired["retried"], 1)
+        self.assertEqual(restarted.get("leases", claim.lease_id)["state"], "EXPIRED")
+        self.assertEqual(
+            restarted.get("tasks", ids["ambiguous-restart"])["state"], "RETRY_WAIT"
+        )
+
+    def test_same_daemon_ambiguous_start_is_not_admitted_for_renewal(self) -> None:
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("ambiguous-local", {}, retry_policy=policy)]
+        )
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": AlwaysAmbiguousAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        daemon = SchedulerDaemon(
+            dispatcher, poll_seconds=0.001, heartbeat_seconds=0.005
+        )
+        daemon._start_supervision()
+        try:
+            self.assertEqual(dispatcher.dispatch_ready(), 0)
+            execution = self.scheduler.list("executions", state="UNKNOWN")[0]
+            lease = self.scheduler.list("leases", state="ACTIVE")[0]
+            original_expiry = lease["expires_at"]
+            time.sleep(0.02)
+            dispatcher.poll_executions()
+            self.assertEqual(dispatcher.supervised_attempt_ids(), set())
+            self.assertEqual(dispatcher.renew_supervised_leases(), 0)
+        finally:
+            daemon._stop_supervision()
+
+        self.assertEqual(
+            self.scheduler.get("leases", lease["id"])["expires_at"], original_expiry
+        )
+        expired = self.scheduler.expire_leases(now=original_expiry + 1)
+        self.assertEqual(expired["retried"], 1)
+        self.assertEqual(self.scheduler.get("leases", lease["id"])["state"], "EXPIRED")
+        self.assertEqual(
+            self.scheduler.get("tasks", ids["ambiguous-local"])["state"], "RETRY_WAIT"
+        )
+        self.assertEqual(
+            self.scheduler.get("executions", execution["id"])["state"], "UNKNOWN"
+        )
+
+    def test_stale_running_start_does_not_escape_or_gain_admission(self) -> None:
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("stale-start", {})])
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": FakeAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+
+        with patch.object(
+            self.scheduler,
+            "confirm_running_and_renew_authority",
+            side_effect=StaleAuthority("lease expired during bounded start"),
+        ):
+            self.assertEqual(dispatcher.dispatch_ready(), 0)
+
+        execution = self.scheduler.list("executions")[0]
+        self.assertEqual(execution["state"], "RUNNING")
+        handle = json.loads(execution["runtime_handle_json"])
+        self.assertEqual(handle["execution_id"], execution["id"])
+        incarnation = self.scheduler.get("incarnations", execution["incarnation_id"])
+        self.assertEqual(json.loads(incarnation["runtime_handle_json"]), handle)
+        self.assertEqual(dispatcher.supervised_attempt_ids(), set())
+        self.assertEqual(dispatcher.renew_supervised_leases(), 0)
+
+    def test_late_ambiguous_start_is_physical_history_not_dispatcher_failure(self) -> None:
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("late-ambiguous", {})])
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": AlwaysAmbiguousAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        with patch.object(
+            self.scheduler,
+            "record_start_ambiguity",
+            side_effect=StaleAuthority("lease expired during bounded start"),
+        ):
+            self.assertEqual(dispatcher.dispatch_ready(), 0)
+
+        execution = self.scheduler.list("executions")[0]
+        self.assertEqual(execution["state"], "UNKNOWN")
+        handle = json.loads(execution["runtime_handle_json"])
+        self.assertEqual(handle["execution_id"], execution["id"])
+        self.assertEqual(dispatcher.supervised_attempt_ids(), set())
+
+    def test_late_failed_start_is_physical_history_not_dispatcher_failure(self) -> None:
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("late-failed", {})])
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": FailedStartAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        with patch.object(
+            self.scheduler,
+            "nack",
+            side_effect=StaleAuthority("lease expired during bounded start"),
+        ):
+            self.assertEqual(dispatcher.dispatch_ready(), 0)
+
+        execution = self.scheduler.list("executions")[0]
+        self.assertEqual(execution["state"], "FAILED")
+        self.assertEqual(execution["failure_code"], "LATE_START_FAILED")
+        self.assertEqual(
+            json.loads(execution["runtime_handle_json"])["thread_id"],
+            "late-failed-thread",
+        )
+        self.assertEqual(dispatcher.supervised_attempt_ids(), set())
+
+    def test_stale_reconcile_running_persists_the_new_physical_locator(self) -> None:
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("stale-reconcile", {})])
+        agent = self.scheduler.list("logical_agents", state="READY")[0]
+        claim = self.scheduler.claim_next(agent["id"])
+        execution_id, request_id = self.scheduler.create_execution(claim)
+        self.scheduler.record_start_ambiguity(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"request_id": request_id},
+        )
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": ReconcileRunningWithNewHandleAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        with patch.object(
+            self.scheduler,
+            "confirm_running_and_renew_authority",
+            side_effect=StaleAuthority("recovery authority ended"),
+        ):
+            self.assertEqual(dispatcher.poll_executions(recovery=True), 1)
+
+        execution = self.scheduler.get("executions", execution_id)
+        handle = json.loads(execution["runtime_handle_json"])
+        self.assertEqual(execution["state"], "RUNNING")
+        self.assertEqual(handle["thread_id"], "recovered-thread")
+        self.assertEqual(handle["turn_id"], "recovered-turn")
+        self.assertEqual(dispatcher.supervised_attempt_ids(), set())
 
     def test_restart_reconciles_completed_execution_before_notification(self) -> None:
         batch_id, ids = self.scheduler.submit_batch([TaskSpec("recovered", {})])
@@ -423,6 +935,12 @@ termination_confirmation = true
         )
         self.assertEqual(
             CodexAppServerAdapter._classify_failure("HTTP 502 bad gateway"),
+            FailureClass.RESOURCE_UNAVAILABLE,
+        )
+        self.assertEqual(
+            CodexAppServerAdapter._classify_failure(
+                '{"codexErrorInfo":"usageLimitExceeded"}'
+            ),
             FailureClass.RESOURCE_UNAVAILABLE,
         )
         self.assertEqual(
